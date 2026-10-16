@@ -1,0 +1,13 @@
+{
+  "description": "Captured synthetic classroom failing baseline; not a production quality baseline",
+  "release": {
+    "commit": "29b9cf3f9e9946ba5f90fef313564d2369d9ba78",
+    "prompt_sha256": "b44b04f727c5aed3638a9a1b8e5184ab07d6b8db39c73cc4a822c6f04bf4f1db",
+    "prompt_version": 3,
+    "dataset_sha256": "71bd6f0e028d1dc1a6bc8dd56355d42dc5ddb2a55a6ed17bfc09a4e3d5c74a86",
+    "artifact_sha256": "b838b8622c6f68490d64e0575239d20d36023245fc4e48653ceec5056f15e10d",
+    "lambda_version": "6"
+  },
+  "case_definitions_sha256": "f36e4e4c80d0976e3016b5f64f8bae34a8020cf8b86f74f78e2e736d182b71ee",
+  "case_hash_note": "Canonical JSON case definitions; original baseline byte digest verified before migration. Ignores platform line endings only."
+}

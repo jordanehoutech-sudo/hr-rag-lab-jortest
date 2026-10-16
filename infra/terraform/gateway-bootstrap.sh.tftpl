@@ -1,0 +1,50 @@
+#!/bin/bash
+set -euo pipefail
+# Never enable shell tracing: environment files contain secrets.
+dnf install -y docker python3
+command -v aws >/dev/null
+systemctl enable --now docker
+install -d -m 700 /opt/hr-gateway
+cat >/opt/hr-gateway/config.yaml <<'YAML'
+model_list:
+  - model_name: ${chat_model}
+    litellm_params:
+      model: bedrock/${chat_model}
+      aws_region_name: ${region}
+  - model_name: ${fallback_model}
+    litellm_params:
+      model: bedrock/${fallback_model}
+      aws_region_name: ${region}
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/DATABASE_URL
+  disable_spend_logs: true
+litellm_settings:
+  num_retries: 0
+  request_timeout: 20
+router_settings:
+  num_retries: 0
+  timeout: 20
+YAML
+cat >/opt/hr-gateway/start.py <<'PY'
+import json, subprocess, time, urllib.request, urllib.parse
+from pathlib import Path
+settings=json.loads(subprocess.check_output(['aws','secretsmanager','get-secret-value','--region','${region}','--secret-id','${settings_secret}','--query','SecretString','--output','text']))
+url='postgresql://llm_gateway:'+urllib.parse.quote(settings['password'],safe='')+'@${host}:5432/litellm?sslmode=require'
+env=Path('/opt/hr-gateway/gateway.env')
+env.write_text('DATABASE_URL='+url+'\nLITELLM_MASTER_KEY='+settings['master_key']+'\nAWS_REGION_NAME=${region}\nAWS_DEFAULT_REGION=${region}\nLITELLM_LOG=ERROR\n')
+env.chmod(0o600)
+subprocess.run(['docker','run','-d','--name','hr-litellm','--restart','unless-stopped','--env-file',str(env),'-p','4000:4000','-v','/opt/hr-gateway/config.yaml:/app/config.yaml:ro','ghcr.io/berriai/litellm:v1.103.4','--config','/app/config.yaml','--port','4000'],check=True,stdout=subprocess.DEVNULL)
+# Startup restarts until setup-db has created the separate database.
+for attempt in range(240):
+    try:
+        body=json.dumps({'key_alias':'hr-generation-and-judges','models':['${chat_model}','${fallback_model}'],'max_budget':5,'budget_duration':'24h','rpm_limit':120,'tpm_limit':120000,'max_parallel_requests':2}).encode()
+        req=urllib.request.Request('http://127.0.0.1:4000/key/generate',data=body,headers={'Authorization':'Bearer '+settings['master_key'],'Content-Type':'application/json'})
+        with urllib.request.urlopen(req,timeout=10) as response:key=json.load(response)['key']
+        subprocess.run(['aws','secretsmanager','put-secret-value','--region','${region}','--secret-id','${key_secret}','--secret-string',json.dumps({'key':key})],check=True,stdout=subprocess.DEVNULL)
+        print('Gateway database, scoped key and limits initialized')
+        break
+    except Exception:time.sleep(10)
+else:raise RuntimeError('Gateway initialization did not finish')
+PY
+python3 /opt/hr-gateway/start.py
