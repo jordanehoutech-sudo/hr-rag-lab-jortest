@@ -55,7 +55,7 @@ def small_talk_reply(question, employee):
 
 
 # How many times round the ask, run tools, ask again loop before giving up.
-MAX_TOOL_ROUNDS = 5
+MAX_TOOL_ROUNDS = 1
 MAX_ANSWER_TOKENS = 2048
 
 # Zero reduces sampling variation, but provider execution can still vary.
