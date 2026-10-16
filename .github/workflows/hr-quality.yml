@@ -34,3 +34,193 @@ jobs:
           cache-dependency-path: frontend/package-lock.json
       - run: npm --prefix frontend ci
       - run: npm --prefix frontend run build
+        # Deploy the reviewed main commit, evaluate it, and approve only passing evidence.
+  candidate:
+    name: Deploy and evaluate staging
+    # Secrets and AWS access are withheld from unreviewed pull-request code.
+    if: >-
+      always() && github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && needs.checks.result == 'success'
+    needs: checks
+    runs-on: ubuntu-latest
+    environment: hr-staging
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      HR_STAGING_FUNCTION: ${{ vars.HR_STAGING_FUNCTION }}
+      HR_EVALUATION_FUNCTION: ${{ vars.HR_EVALUATION_FUNCTION }}
+      HR_STAGING_ORIGIN: ${{ vars.HR_STAGING_ORIGIN }}
+      HR_TEST_USERS_SECRET_ARN: ${{ vars.HR_TEST_USERS_SECRET_ARN }}
+      HR_COGNITO_POOL_ID: ${{ vars.HR_COGNITO_POOL_ID }}
+      HR_COGNITO_CLIENT_ID: ${{ vars.HR_COGNITO_CLIENT_ID }}
+      LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
+      LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
+      LANGFUSE_BASE_URL: ${{ vars.LANGFUSE_BASE_URL }}
+      HR_STAGING_FRONTEND_BUCKET: ${{ vars.HR_STAGING_FRONTEND_BUCKET }}
+      HR_STAGING_DISTRIBUTION_ID: ${{ vars.HR_STAGING_DISTRIBUTION_ID }}
+      VITE_AUTH_MODE: cognito
+      VITE_COGNITO_AUTHORITY: ${{ vars.VITE_COGNITO_AUTHORITY }}
+      VITE_COGNITO_CLIENT_ID: ${{ vars.HR_COGNITO_CLIENT_ID }}
+      VITE_COGNITO_DOMAIN: ${{ vars.VITE_COGNITO_DOMAIN }}
+      EVAL_REPEATS: '2'
+      DO_NOT_TRACK: '1'
+      DEEPEVAL_TELEMETRY_OPT_OUT: 'true'
+      EVAL_JUDGE_MODEL: ${{ vars.EVAL_JUDGE_MODEL }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r ci/requirements.txt
+      # Exchange GitHub identity for short-lived credentials in the scoped AWS role.
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_STAGING_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      # Build the UI from this commit and upload it to the staging frontend.
+      - name: Build and deploy React to staging
+        run: |
+          npm --prefix frontend ci
+          npm --prefix frontend run build
+          python ci/deploy_frontend.py
+      # Publish the prompt version and package it with the matching backend code.
+      - name: Publish exact candidate prompt and package it
+        run: python ci/release.py --publish
+      - name: Deploy the new backend version to staging
+        run: python ci/deploy_candidate.py
+      # Obtain fresh test-user tokens and run every reference case twice through the API.
+      - name: Test the real authenticated application
+        id: live
+        run: python ci/evaluate_api.py
+      # Store captured answers and scores for version comparisons; no extra generation here.
+      - name: Record the dataset experiment in Langfuse
+        if: always() && steps.live.outcome != 'skipped'
+        uses: langfuse/experiment-action@76731c8b04fc7f962af689207690d414a0ee4de7 # v1.0.11
+        with:
+          langfuse_public_key: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
+          langfuse_secret_key: ${{ secrets.LANGFUSE_SECRET_KEY }}
+          langfuse_base_url: ${{ vars.LANGFUSE_BASE_URL }}
+          experiment_path: ci/langfuse_experiment.py
+          should_skip_sdk_installation: 'true'
+          should_fail_on_regression: 'true'
+          should_fail_on_script_error: 'true'
+          should_comment_on_pr: 'false'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Independently assert captured API answers with Promptfoo
+        if: always() && steps.live.outcome != 'skipped'
+        run: python ci/prepare_promptfoo.py
+      # Assert expected facts, forbidden disclosures and sources in the captured answers.
+      - name: Promptfoo evaluation action
+        if: always() && steps.live.outcome != 'skipped'
+        uses: promptfoo/promptfoo-action@04839e664f52212b877170219dab0d7ad2bf6440 # v1
+        with:
+          github-token: ${{ github.token }}
+          config: ci/promptfoo.generated.json
+          promptfoo-version: '0.124.1'
+          use-config-prompts: 'true'
+          force-run: 'true'
+          fail-on-threshold: '100'
+          no-share: 'true'
+          disable-comment: 'true'
+          no-cache: 'true'
+          no-table: 'true'
+          no-progress-bar: 'true'
+      # Use a model grader through the gateway-backed evaluation Lambda.
+      - name: Evaluate answer quality with DeepEval
+        if: vars.ENABLE_DEEPEVAL == 'true'
+        run: |
+          python -m pip install -r ci/requirements-demo.txt
+          python ci/deepeval_check.py
+      - name: Prepare Evidently numeric drift inputs
+        if: always() && steps.live.outcome != 'skipped' && vars.ENABLE_EVIDENTLY == 'true'
+        run: python ci/prepare_drift.py
+      # Compare latency and answer-length distributions; drift is an investigation signal.
+      - name: Evidently proxy drift report
+        if: always() && steps.live.outcome != 'skipped' && vars.ENABLE_EVIDENTLY == 'true'
+        uses: evidentlyai/evidently-report-action@7b255ad073b66f0a2f511393edf24d2907c15008 # v1
+        with:
+          config_path: ci/evidently_config.py:conf
+          input_path: build/drift-current.csv
+          reference_path: ci/data/drift-reference.csv
+          output: build/evidently-report
+          test_summary: 'false'
+          save_dataset: 'false'
+          save_report: 'true'
+          upload_artifacts: 'true'
+          check-link: 'false'
+      # Update the approved staging alias only after required preceding checks pass.
+      - name: Approve the exact tested staging version
+        if: success()
+        run: python ci/promote_lab.py
+      # Retain a sanitized report even when evaluation fails.
+      - name: Publish public-safe report
+        if: always()
+        run: |
+          if test -f build/evaluation.json; then
+            python ci/report.py
+            cat build/report.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'Evaluation did not complete; release is blocked.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Report on associated pull requests
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            if (!fs.existsSync('build/report.md')) return;
+            const pulls = await github.rest.repos.listPullRequestsAssociatedWithCommit({owner:context.repo.owner,repo:context.repo.repo,commit_sha:context.sha});
+            const body = 'HR staging evaluation report (review all workflow jobs before release)\n\n' + fs.readFileSync('build/report.md','utf8');
+            for (const pr of pulls.data) await github.rest.issues.createComment({owner:context.repo.owner,repo:context.repo.repo,issue_number:pr.number,body});
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hr-candidate-evidence
+          # Raw answers are intentionally excluded; inspect them only in approved restricted storage.
+          path: |
+            build/release.json
+            build/report.md
+            build/function.zip
+            build/previous-approved.json
+          retention-days: 3
+          # Demonstrate the approval boundary without deploying production infrastructure.
+  production-handoff-dry-run:
+    name: Production handoff (dry run)
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: candidate
+    runs-on: ubuntu-latest
+    environment: hr-production-approval
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: hr-candidate-evidence
+          path: evidence
+      - name: Verify exact tested release and show production handoff
+        env:
+          EXPECTED_COMMIT: ${{ github.sha }}
+        run: |-
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          release=json.loads(Path('evidence/release.json').read_text())
+          report=Path('evidence/report.md').read_text()
+          if release['commit'] != os.environ['EXPECTED_COMMIT']:
+              raise SystemExit('Release does not match the merged commit')
+          if 'Release gate: PASS.' not in report:
+              raise SystemExit('A passing evaluation report is required')
+          print('DEMONSTRATION ONLY: production would receive the tested backend artifact and exact prompt version.')
+          print('React would be built from this same commit with production configuration.')
+          print('No production resources or traffic are changed by this dry-run job.')
+          PY
